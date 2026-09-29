@@ -1,0 +1,35 @@
+{
+  "name": "ai-incident-triage",
+  "version": "1.0.0",
+  "description": "AI-powered Incident Triage Assistant with RAG-based resolution recommendations and synthetic data evaluation",
+  "main": "dist/src/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/server.js",
+    "dev": "ts-node src/server.ts",
+    "test": "ts-node tests/triage.test.ts",
+    "benchmark": "ts-node scripts/runBenchmark.ts"
+  },
+  "keywords": [
+    "incident-triage",
+    "sre",
+    "rag",
+    "gemini",
+    "synthetic-data"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@google/genai": "^2.22.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}

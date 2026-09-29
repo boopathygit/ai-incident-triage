@@ -1,0 +1,457 @@
+[
+  {
+    "id": "RB-DB-001",
+    "title": "PostgreSQL Connection Pool Exhaustion",
+    "category": "Database",
+    "symptoms": [
+      "FATAL: remaining connection slots are reserved for non-replication superuser connections",
+      "SequelizeConnectionAcquireTimeoutError",
+      "psycopg2.OperationalError: server closed the connection unexpectedly",
+      "API p99 latency spike to >15s across all read/write endpoints",
+      "Active connections count hitting max_connections ceiling in Grafana/RDS"
+    ],
+    "root_causes": [
+      "Backend microservice instances scaled out rapidly without PgBouncer connection pooling",
+      "Long-running analytical queries blocking connection recycling",
+      "Unclosed transaction connections leaking in worker threads"
+    ],
+    "diagnostic_commands": [
+      "SELECT count(*), state, usename FROM pg_stat_activity GROUP BY state, usename;",
+      "SELECT pid, now() - query_start AS duration, query, state FROM pg_stat_activity WHERE state != 'idle' ORDER BY duration DESC LIMIT 10;",
+      "kubectl get pods -l app=pgbouncer -o wide",
+      "aws rds describe-db-instances --db-instance-identifier prod-postgres-primary --query 'DBInstances[*].{ID:DBInstanceIdentifier,Status:DBInstanceStatus,MaxConn:MaxConnections}'"
+    ],
+    "mitigation_steps": [
+      "Terminate long-running uncommitted idle in transaction queries: SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND now() - query_start > interval '5 minutes';",
+      "Scale up PgBouncer pooler replicas or adjust max_client_conn in pgbouncer.ini",
+      "Rate-limit or pause asynchronous bulk-report cron jobs triggering large table scans",
+      "Temporarily increase max_connections if memory permits, followed by controlled rolling restart of pooler"
+    ],
+    "long_term_fix": "Enforce strict query timeout (statement_timeout = '15s') in application ORM and route all analytical workloads to read replicas.",
+    "primary_team": "Data & Database Platform",
+    "related_services": ["postgres-primary", "pgbouncer", "api-gateway", "worker-queue"],
+    "tags": ["postgres", "connections", "database", "timeout", "pgbouncer"]
+  },
+  {
+    "id": "RB-DB-002",
+    "title": "PostgreSQL Deadlocks and Blocked Transactions",
+    "category": "Database",
+    "symptoms": [
+      "ERROR: deadlock detected - Process X waits for ExclusiveLock",
+      "Database row-level lock wait queue spiking",
+      "Checkout and user update requests failing with 500 internal errors",
+      "High lock duration in pg_stat_database"
+    ],
+    "root_causes": [
+      "Concurrent update operations updating foreign key parent/child tables in non-uniform key order",
+      "Batch jobs acquiring table-level locks concurrently with user-facing transactional writes"
+    ],
+    "diagnostic_commands": [
+      "SELECT blocked_locks.pid AS blocked_pid, blocking_locks.pid AS blocking_pid, blocked_activity.query AS blocked_statement, blocking_activity.query AS current_statement_in_blocking_process FROM pg_catalog.pg_locks blocked_locks JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid JOIN pg_catalog.pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid WHERE NOT blocked_locks.granted;",
+      "grep -i 'deadlock detected' /var/log/postgresql/postgresql.log"
+    ],
+    "mitigation_steps": [
+      "Identify the blocking process PID and cancel the transaction: SELECT pg_cancel_backend(blocking_pid);",
+      "If unresponsive, terminate the blocking backend: SELECT pg_terminate_backend(blocking_pid);",
+      "Temporarily disable the offending batch background migration job"
+    ],
+    "long_term_fix": "Audit conflicting transactions to standardize lock ordering and add optimistic concurrency locking.",
+    "primary_team": "Data & Database Platform",
+    "related_services": ["postgres-primary", "order-service", "inventory-service"],
+    "tags": ["deadlock", "postgres", "locks", "transaction", "database"]
+  },
+  {
+    "id": "RB-SEC-001",
+    "title": "OAuth2 / JWT Signature Verification & JWKS Key Rotation Failure",
+    "category": "Security & Auth",
+    "symptoms": [
+      "All authenticated API requests failing with HTTP 401 Unauthorized",
+      "JsonWebTokenError: invalid signature or invalid algorithm",
+      "Error: Unable to verify JWT against JWKS URI: https://auth.company.com/.well-known/jwks.json",
+      "Customer login sessions invalidated en masse"
+    ],
+    "root_causes": [
+      "Identity Provider (Auth0/Okta/Keycloak) rotated private signing key without downstream JWKS cache invalidation",
+      "Microservice JWKS client caching outdated public key kid with zero TTL fallback",
+      "Clock skew between Auth server and API gateway exceeding token leeway (nbf/exp)"
+    ],
+    "diagnostic_commands": [
+      "curl -s https://auth.prod.internal/.well-known/jwks.json | jq .",
+      "kubectl logs -l app=api-gateway --tail=100 | grep -E 'JWKS|jwt|signature'",
+      "ntpq -p",
+      "jwt decode --json <SAMPLE_BEARER_TOKEN>"
+    ],
+    "mitigation_steps": [
+      "Trigger manual cache flush on API gateway JWKS client cache: POST /admin/internal/jwks/flush-cache",
+      "Verify that the new kid in the incoming JWT matches the published keys in jwks.json",
+      "If identity provider rotation failed, revert the active signing key ID in the auth management console"
+    ],
+    "long_term_fix": "Implement resilient JWKS cache-on-demand fetching when an unknown kid is encountered with strict rate limiting.",
+    "primary_team": "Security Operations (SecOps)",
+    "related_services": ["auth-service", "api-gateway", "identity-provider"],
+    "tags": ["jwt", "auth", "oauth", "security", "jwks", "401"]
+  },
+  {
+    "id": "RB-SEC-002",
+    "title": "Credential Stuffing & Distributed Brute-Force Attack",
+    "category": "Security & Auth",
+    "symptoms": [
+      "Astronomical surge in POST /api/v1/auth/login attempts from residential proxies",
+      "Failure rate of login attempts spiking from normal 4% to 92%",
+      "WAF (Cloudflare/AWS WAF) anomaly alert triggered on rate limit thresholds",
+      "High CPU load on bcrypt password hashing workers in Auth service"
+    ],
+    "root_causes": [
+      "Compromised credential database combo-list dumped online being tested against public auth endpoints",
+      "Lack of IP-reputation and CAPTCHA challenge on repeated bad credentials"
+    ],
+    "diagnostic_commands": [
+      "aws wafv2 get-sampled-requests --web-acl-arn <ARN> --rule-metric-name LoginRateLimit --scope CLOUDFRONT --time-window StartTime=...,EndTime=... --max-items 50",
+      "kubectl logs -l app=auth-service --tail=200 | grep 'login_failed' | awk '{print $NF}' | sort | uniq -c | sort -nr | head -20"
+    ],
+    "mitigation_steps": [
+      "Enable Cloudflare 'Under Attack' mode or tighten WAF IP rate limit rule on /auth/login to 5 req/min per IP",
+      "Enforce mandatory Turnstile / reCAPTCHA challenge on the login endpoint",
+      "Lock accounts exhibiting >10 consecutive failed attempts and notify users to reset passwords"
+    ],
+    "long_term_fix": "Integrate HaveIBeenPwned password breach check and deploy bot management with machine learning behavioral scoring.",
+    "primary_team": "Security Operations (SecOps)",
+    "related_services": ["auth-service", "waf-cloudflare", "edge-router"],
+    "tags": ["security", "brute-force", "waf", "credential-stuffing", "auth"]
+  },
+  {
+    "id": "RB-INFRA-001",
+    "title": "Kubernetes Pod OOMKilled (Out of Memory) CrashLoop",
+    "category": "Infrastructure & Cloud",
+    "symptoms": [
+      "Pods in CrashLoopBackOff with Last State: Terminated, Reason: OOMKilled, Exit Code: 137",
+      "Service capacity degraded causing 503 Service Unavailable / 504 Gateway Timeout",
+      "Prometheus alert: KubePodCrashLooping & ContainerMemoryUsageTooHigh",
+      "HPA flapping or failing to spin up healthy replicas in time"
+    ],
+    "root_causes": [
+      "Container memory limit (resources.limits.memory) set too tight for incoming traffic spike",
+      "Unbounded in-memory queue or caching without eviction policy",
+      "JVM / Node heap size configured higher than container cgroup limit"
+    ],
+    "diagnostic_commands": [
+      "kubectl get pods -n production -l app=<SERVICE_NAME> -o wide",
+      "kubectl describe pod <POD_NAME> -n production | grep -A 5 -B 2 OOMKilled",
+      "kubectl top pods -n production --sort-by=memory",
+      "kubectl logs <POD_NAME> -n production --previous --tail=100"
+    ],
+    "mitigation_steps": [
+      "Bump container memory limits in deployment spec: kubectl set resources deployment <DEPLOYMENT_NAME> -n production --limits=memory=2Gi,cpu=1000m",
+      "Scale up deployment replica count to distribute memory load: kubectl scale deployment <DEPLOYMENT_NAME> -n production --replicas=10",
+      "Restart failing deployment to reclaim leaked memory: kubectl rollout restart deployment <DEPLOYMENT_NAME> -n production"
+    ],
+    "long_term_fix": "Profile heap dump with Chrome DevTools/JProfiler, fix memory leak, and configure Vertical Pod Autoscaler (VPA).",
+    "primary_team": "SRE & Infrastructure",
+    "related_services": ["kubernetes-cluster", "ingress-controller", "order-service", "search-service"],
+    "tags": ["kubernetes", "oomkilled", "memory", "crashloop", "infra", "sre"]
+  },
+  {
+    "id": "RB-INFRA-002",
+    "title": "Persistent Volume Claim (PVC) Disk Space Exhaustion",
+    "category": "Infrastructure & Cloud",
+    "symptoms": [
+      "StatefulSet pods crashing with 'No space left on device' (ENOSPC)",
+      "Database or Kafka/Elasticsearch broker refusing writes",
+      "Prometheus alert: DiskSpaceFillingUp (Predict1HourRemaining)",
+      "Read-only filesystem error mounted on /var/data"
+    ],
+    "root_causes": [
+      "Unrotated log files accumulating in container volume",
+      "Elasticsearch index retention policy not trimming old indices",
+      "Unexpected write surge without volume autoscaling"
+    ],
+    "diagnostic_commands": [
+      "kubectl exec -it <POD_NAME> -n production -- df -h",
+      "kubectl exec -it <POD_NAME> -n production -- du -sh /var/data/* | sort -rh | head -10",
+      "kubectl get pvc -n production"
+    ],
+    "mitigation_steps": [
+      "Trigger immediate volume expansion: edit PVC storage spec from 100Gi to 200Gi (if storage class supports VolumeExpansion)",
+      "Clean up old archived logs and temporary files: kubectl exec -it <POD_NAME> -n production -- find /var/log -name '*.gz' -mtime +7 -delete",
+      "For Elasticsearch/Kafka, execute index curator to drop oldest snapshots/topics"
+    ],
+    "long_term_fix": "Implement automated storage retention policies and configure volume expansion alerts at 75% threshold.",
+    "primary_team": "SRE & Infrastructure",
+    "related_services": ["kafka", "elasticsearch", "persistent-storage", "kubernetes"],
+    "tags": ["disk", "pvc", "storage", "enospc", "infra", "volume"]
+  },
+  {
+    "id": "RB-API-001",
+    "title": "Upstream Gateway Timeout and Cascading Circuit Breaker Trips",
+    "category": "API & Microservices",
+    "symptoms": [
+      "HTTP 504 Gateway Timeout and 503 Service Unavailable spikes on Edge API Gateway",
+      "Circuit breaker state transitioned to OPEN for downstream checkout-service",
+      "Thread pool exhaustion in Kong / Envoy / Express gateway",
+      "Customer checkout completion rate dropping to near zero"
+    ],
+    "root_causes": [
+      "Downstream microservice experiencing latency degradation due to database lock contention",
+      "Absence of deadline propagation / aggressive client retry storms without exponential backoff",
+      "Thread pool queue overflowing in the API gateway"
+    ],
+    "diagnostic_commands": [
+      "curl -I https://api.production.internal/health",
+      "kubectl logs -l app=api-gateway -n production --tail=200 | grep 'upstream request timeout'",
+      "istioctl proxy-config endpoints <ENVOY_POD> | grep -E 'checkout-service|504'",
+      "kubectl top pods -n production -l app=checkout-service"
+    ],
+    "mitigation_steps": [
+      "Enable circuit breaker fallback response (cached/degraded mode) to shed load from failing downstream service",
+      "Scale up downstream service replicas to process queued requests: kubectl scale deployment checkout-service -n production --replicas=15",
+      "Temporarily drop client retry storm at gateway layer by rejecting retried idempotent headers with HTTP 429"
+    ],
+    "long_term_fix": "Implement strict distributed tracing with OpenTelemetry, gRPC/HTTP deadline budgets, and exponential backoff with jitter.",
+    "primary_team": "Core API & Microservices",
+    "related_services": ["api-gateway", "checkout-service", "envoy", "service-mesh"],
+    "tags": ["api", "timeout", "504", "circuit-breaker", "microservices", "latency"]
+  },
+  {
+    "id": "RB-API-002",
+    "title": "Redis Cache Cache Stampede and Connection Saturations",
+    "category": "API & Microservices",
+    "symptoms": [
+      "Redis CPU utilization hitting 100% on primary node",
+      "Sudden flood of DB queries for hot cached keys (e.g. homepage categories / configuration)",
+      "Redis error: ERR max number of clients reached (maxclients)",
+      "P99 latency of API services jumping from 25ms to 3200ms"
+    ],
+    "root_causes": [
+      "High-traffic cache key expired without probabilistic early recomputation (cache stampede / thundering herd)",
+      "Unbounded Redis keyspace without maxmemory eviction policy (volatile-lru)",
+      "Microservice instances opening new Redis connections on every request instead of connection pool reuse"
+    ],
+    "diagnostic_commands": [
+      "redis-cli -h redis-cluster.prod info stats | grep -E 'total_commands_processed|instantaneous_ops_per_sec'",
+      "redis-cli -h redis-cluster.prod --latency-history",
+      "redis-cli -h redis-cluster.prod info clients | grep connected_clients",
+      "redis-cli -h redis-cluster.prod slowlog get 10"
+    ],
+    "mitigation_steps": [
+      "Manually warm and set high-traffic expired cache key with extended TTL: redis-cli -h redis-cluster.prod SET <HOT_KEY> <VALUE> EX 86400",
+      "Activate mutex locking (single-flight) in the backend to ensure only 1 worker computes cache misses",
+      "Increase maxclients on Redis node: redis-cli -h redis-cluster.prod CONFIG SET maxclients 20000"
+    ],
+    "long_term_fix": "Add XFetch / probabilistic early expiration to all hot keys and use client-side caching (Redis RESP3).",
+    "primary_team": "Core API & Microservices",
+    "related_services": ["redis", "api-gateway", "product-catalog-service"],
+    "tags": ["redis", "cache", "cache-stampede", "latency", "api"]
+  },
+  {
+    "id": "RB-PAY-001",
+    "title": "Payment Webhook Failure and Signature Verification Mismatch",
+    "category": "Billing & Payments",
+    "symptoms": [
+      "Stripe/Adyen webhook dashboard showing 100% 400 Bad Request delivery failures",
+      "Customer subscriptions not activating after successful credit card charge",
+      "Application log: StripeSignatureVerificationError: No signatures found matching the expected signature for payload",
+      "Order status stuck in 'payment_pending' state"
+    ],
+    "root_causes": [
+      "Stripe webhook signing secret rotated in merchant dashboard without updating backend env var STRIPE_WEBHOOK_SECRET",
+      "Express body-parser middleware parsing JSON before raw body verification, mutating payload bytes",
+      "Reverse proxy stripping or modifying Stripe-Signature HTTP header"
+    ],
+    "diagnostic_commands": [
+      "kubectl logs -l app=payment-service -n production --tail=100 | grep -i 'StripeSignatureVerificationError'",
+      "kubectl get secret payment-secrets -n production -o jsonpath='{.data.STRIPE_WEBHOOK_SECRET}' | base64 --decode",
+      "stripe listen --forward-to localhost:4000/webhook (in staging environment)"
+    ],
+    "mitigation_steps": [
+      "Retrieve active signing secret from Stripe Dashboard -> Developers -> Webhooks and update Kubernetes secret",
+      "Trigger rolling update of payment service: kubectl rollout restart deployment payment-service -n production",
+      "Replay failed webhook events from Stripe dashboard CLI once verification is restored: stripe events resend <EVENT_ID>"
+    ],
+    "long_term_fix": "Use automated secret synchronization from AWS Secrets Manager / HashiCorp Vault with zero-downtime dual-secret support.",
+    "primary_team": "Payments & Monetization",
+    "related_services": ["payment-service", "stripe", "billing-worker"],
+    "tags": ["payments", "stripe", "webhook", "billing", "signature", "400"]
+  },
+  {
+    "id": "RB-FE-001",
+    "title": "Frontend Single Page App Chunk Loading Error",
+    "category": "Frontend & Client",
+    "symptoms": [
+      "ChunkLoadError: Loading chunk 842 failed (missing: https://cdn.company.com/assets/842.a9f4c.js)",
+      "Users seeing blank white screen of death or broken routing navigation",
+      "Sentry / Datadog RUM reporting 10,000+ ChunkLoadError events following new frontend release",
+      "Edge CDN returning 404 Not Found on hashed JavaScript chunks"
+    ],
+    "root_causes": [
+      "New frontend deployment purged older hashed chunks from S3/GCS bucket before users with older index.html reloaded",
+      "CDN edge cache purging delay causing partial cache miss on newer asset bundles"
+    ],
+    "diagnostic_commands": [
+      "curl -I https://cdn.company.com/assets/842.a9f4c.js",
+      "aws s3 ls s3://prod-frontend-assets/assets/ | grep 842.a9f4c",
+      "curl -s https://app.company.com/ | grep -o 'assets/.*.js'"
+    ],
+    "mitigation_steps": [
+      "Restore previous build's /assets folder back to S3 bucket without overwriting index.html so both versions coexist",
+      "Trigger fast CDN cache invalidation for /*: aws cloudfront create-invalidation --distribution-id <DIST_ID> --paths '/*'",
+      "Deploy window.addEventListener('error') script in index.html to force one-time auto-reload on ChunkLoadError"
+    ],
+    "long_term_fix": "Configure asset pipeline with immutable S3 storage retention (keep historical chunks for 30 days) and dynamic lazy retry wrapper.",
+    "primary_team": "Frontend Platform",
+    "related_services": ["frontend-cdn", "s3-bucket", "cloudfront", "web-app"],
+    "tags": ["frontend", "chunkloaderror", "cdn", "javascript", "sentry"]
+  },
+  {
+    "id": "RB-NET-001",
+    "title": "CoreDNS Resolution Failures and Service Discovery Breakdown",
+    "category": "Network & CDN",
+    "symptoms": [
+      "Internal service-to-service calls failing with 'dial tcp: lookup order-service.production.svc.cluster.local: i/o timeout'",
+      "Pods unable to resolve external domains (e.g. api.stripe.com, api.datadog.com)",
+      "Prometheus alert: CoreDNSLatencyHigh / CoreDNSErrorsHigh",
+      "Cascading 500 errors across all microservice boundaries"
+    ],
+    "root_causes": [
+      "CoreDNS deployment under-provisioned for cluster query rate (exhausting 1000m CPU limit)",
+      "Conntrack table saturation on worker nodes causing UDP packet drops for DNS queries (port 53)",
+      "ndots:5 default in resolv.conf generating 5 redundant DNS queries per lookup"
+    ],
+    "diagnostic_commands": [
+      "kubectl logs -l k8s-app=kube-dns -n kube-system --tail=100",
+      "kubectl top pods -n kube-system -l k8s-app=kube-dns",
+      "kubectl exec -it <ANY_POD> -- nslookup kubernetes.default",
+      "dmesg -T | grep -i 'nf_conntrack: table full'"
+    ],
+    "mitigation_steps": [
+      "Scale up CoreDNS replicas immediately: kubectl scale deployment coredns -n kube-system --replicas=8",
+      "Deploy NodeLocal DNSCache daemonset to intercept DNS queries locally on node loopback",
+      "Increase nf_conntrack_max sysctl on worker nodes if table saturation is detected"
+    ],
+    "long_term_fix": "Implement NodeLocal DNSCache cluster-wide and configure Autopath in CoreDNS configmap.",
+    "primary_team": "SRE & Infrastructure",
+    "related_services": ["coredns", "kube-system", "kubernetes-networking"],
+    "tags": ["dns", "coredns", "networking", "lookup-timeout", "sre"]
+  },
+  {
+    "id": "RB-SEC-003",
+    "title": "TLS/mTLS Certificate Expiration and Auto-Renewal Failure",
+    "category": "Security & Auth",
+    "symptoms": [
+      "Cert-manager warning: Internal mTLS leaf certificate will expire",
+      "Auto-renewal failed due to DNS challenge timeout",
+      "Certificate lifecycle alert: cert expiring within threshold",
+      "SSL handshake failure: certificate has expired (x509: certificate signed by unknown authority)"
+    ],
+    "root_causes": [
+      "Cert-manager Let's Encrypt / Vault DNS01 challenge webhook timing out",
+      "ACME challenge token propagation delay on authoritative nameserver",
+      "Stale ClusterIssuer credentials or expired IAM role for Route53/Cloud DNS"
+    ],
+    "diagnostic_commands": [
+      "kubectl describe certificate -n production",
+      "kubectl describe certificaterequest -n production",
+      "kubectl logs -l app=cert-manager -n cert-manager --tail=100",
+      "openssl s_client -connect <SERVICE_HOST>:443 -servername <SERVICE_HOST> -showcerts </dev/null"
+    ],
+    "mitigation_steps": [
+      "Trigger manual cert renewal: kubectl cert-manager renew <CERTIFICATE_NAME> -n production",
+      "Verify DNS01 challenge TXT record propagation via dig @8.8.8.8 _acme-challenge.<DOMAIN> TXT",
+      "If automated challenge is broken, issue emergency 90-day self-signed or internal CA certificate"
+    ],
+    "long_term_fix": "Set up Prometheus alert rule at 14 days before certificate expiration and configure HTTP-01 challenge fallback.",
+    "primary_team": "Security Operations (SecOps)",
+    "related_services": ["cert-manager", "telemetry-collector-service", "ingress-controller"],
+    "tags": ["certificate", "tls", "mtls", "ssl", "cert-manager", "security"]
+  },
+  {
+    "id": "RB-PAY-002",
+    "title": "Payment Idempotency Key Conflicts and Concurrency Collisions",
+    "category": "Billing & Payments",
+    "symptoms": [
+      "Payment API surge in 409 Conflict responses",
+      "Idempotency-Key collision on checkout purchase submissions",
+      "Users experiencing double-click checkout errors",
+      "Log: Idempotency conflict: simultaneous requests with identical key in-flight"
+    ],
+    "root_causes": [
+      "Frontend checkout button not disabled immediately upon initial click submission",
+      "Aggressive client-side HTTP timeout retry submitting identical idempotency key before worker lock release",
+      "Distributed redis lock duration on idempotency keys set too short"
+    ],
+    "diagnostic_commands": [
+      "kubectl logs -l app=payment-service -n production --tail=200 | grep '409 Conflict'",
+      "redis-cli -h redis-cluster.prod KEYS 'idempotency:*' | head -20",
+      "curl -X POST https://api.production.internal/v1/charges -H 'Idempotency-Key: test-key' -v"
+    ],
+    "mitigation_steps": [
+      "Deploy hotfix to debounce checkout button in web & mobile clients (disable button on click)",
+      "Return HTTP 425 Too Early or poll status URL instead of immediate hard 409 error",
+      "Adjust idempotency lock TTL in payment-service config from 3s to 15s"
+    ],
+    "long_term_fix": "Standardize IETF Idempotency-Key draft specifications across mobile and web checkout flows.",
+    "primary_team": "Payments & Monetization",
+    "related_services": ["payment-service", "checkout-ui", "redis"],
+    "tags": ["idempotency", "payments", "checkout", "conflict", "billing"]
+  },
+  {
+    "id": "RB-API-003",
+    "title": "Deprecated API Endpoint Sunset and Migration Enforcement",
+    "category": "API & Microservices",
+    "symptoms": [
+      "Clients calling deprecated /api/v1 endpoint instead of /api/v2",
+      "Sunset header telemetry logging high volume on legacy routes",
+      "Recommendation API deprecation notices in gateway metrics",
+      "Downstream v1 payload schema parsing overhead"
+    ],
+    "root_causes": [
+      "Legacy mobile client app versions have not been forced to update",
+      "Third-party partner integrations still pointing to v1 URL routes",
+      "Lack of progressive rate-limiting or artificial latency degradation on deprecated routes"
+    ],
+    "diagnostic_commands": [
+      "kubectl logs -l app=api-gateway -n production --tail=100 | grep 'Sunset'",
+      "curl -I https://api.production.internal/api/v1/recommendations",
+      "SELECT user_agent, count(*) FROM api_access_logs WHERE path LIKE '/api/v1/%' GROUP BY user_agent ORDER BY count DESC LIMIT 10;"
+    ],
+    "mitigation_steps": [
+      "Verify that Sunset and Deprecation HTTP headers are correctly returned with RFC 8594 compliance",
+      "Send migration reminder notifications to partner developers identifying top caller IPs",
+      "Schedule brownout test (introduce 500ms artificial latency on v1) to incentivize upgrade"
+    ],
+    "long_term_fix": "Enforce minimum supported mobile app build version and establish automated API retirement policy.",
+    "primary_team": "Core API & Microservices",
+    "related_services": ["recommendation-service", "api-gateway"],
+    "tags": ["deprecated", "api", "sunset", "v1", "recommendations"]
+  },
+  {
+    "id": "RB-NET-002",
+    "title": "Edge CDN Ingress Transit Latency and Regional POP Degradation",
+    "category": "Network & CDN",
+    "symptoms": [
+      "Elevated edge ingress latency in specific region (e.g. US-West)",
+      "Cloudflare/Fastly reporting increased TTFB transit between POP and origin",
+      "ISP fiber cut or peering congestion impacting edge traffic",
+      "User interactive latency degraded in Pacific Northwest"
+    ],
+    "root_causes": [
+      "Upstream Tier 1 transit provider experiencing fiber cut / subsea cable maintenance",
+      "BGP Anycast routing suboptimal routes to origin datacenters",
+      "Edge origin health check threshold flapping"
+    ],
+    "diagnostic_commands": [
+      "mtr -rw --report --report-cycles=10 <ORIGIN_IP>",
+      "traceroute <ORIGIN_IP>",
+      "curl -w '@curl-format.txt' -o /dev/null -s https://edge.production.internal/health",
+      "curl -s https://www.cloudflarestatus.com/api/v2/status.json | jq ."
+    ],
+    "mitigation_steps": [
+      "Reroute Cloudflare edge ingress traffic from congested POP to neighboring healthy POP (e.g. Portland -> San Jose)",
+      "Enable Cloudflare Argo Smart Routing to bypass congested transit backbones",
+      "Increase origin keep-alive timeout on edge reverse proxies"
+    ],
+    "long_term_fix": "Deploy multi-cloud dual-origin redundancy with automated latency-based BGP steering.",
+    "primary_team": "SRE & Infrastructure",
+    "related_services": ["ingress-controller", "cloudflare", "edge-router"],
+    "tags": ["ingress", "latency", "cdn", "cloudflare", "transit", "network", "pop"]
+  }
+]

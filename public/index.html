@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Incident Triage Assistant | SRE Command Center</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-badge">
+        <span class="pulse-dot"></span>
+        <span class="logo-icon">🚨</span>
+      </div>
+      <div>
+        <h1>AI Incident Triage Assistant</h1>
+        <p class="subtitle">Autonomous Classification, RAG Runbook Retrieval & Intelligent Escalation</p>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="engine-indicator" id="engineIndicator">
+        <span class="engine-dot"></span>
+        <span id="engineLabel">Detecting Engine...</span>
+      </div>
+      <button class="btn btn-outline btn-sm" id="btnSettings">⚙️ Settings</button>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="nav-tabs">
+    <button class="nav-tab active" data-tab="tab-triage">
+      <span class="tab-icon">⚡</span> Live Triage Console
+    </button>
+    <button class="nav-tab" data-tab="tab-feed">
+      <span class="tab-icon">📋</span> Synthetic Incidents Feed
+      <span class="badge badge-count" id="feedCount">18</span>
+    </button>
+    <button class="nav-tab" data-tab="tab-kb">
+      <span class="tab-icon">📚</span> RAG Knowledge Base
+      <span class="badge badge-count" id="kbCount">15</span>
+    </button>
+    <button class="nav-tab" data-tab="tab-benchmark">
+      <span class="tab-icon">🔬</span> Benchmark & Accuracy
+      <span class="badge badge-success">100% Acc</span>
+    </button>
+  </nav>
+
+  <!-- Main Container -->
+  <main class="main-container">
+
+    <!-- TAB 1: LIVE TRIAGE CONSOLE -->
+    <section id="tab-triage" class="tab-content active">
+      <div class="triage-grid">
+        <!-- Left: Input Form & Presets -->
+        <div class="card input-card">
+          <div class="card-header">
+            <h2>📥 Ingest Incident Ticket</h2>
+            <div class="preset-dropdown-wrap">
+              <label for="presetSelect">Load Preset:</label>
+              <select id="presetSelect" class="form-control">
+                <option value="">-- Choose Synthetic Scenario --</option>
+              </select>
+            </div>
+          </div>
+
+          <form id="triageForm" class="triage-form">
+            <div class="form-group">
+              <label for="ticketTitle">Incident Title</label>
+              <input type="text" id="ticketTitle" class="form-control" placeholder="e.g., PostgreSQL Primary Connection Exhaustion" required>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group col-half">
+                <label for="ticketService">Affected Service / Component</label>
+                <input type="text" id="ticketService" class="form-control" placeholder="e.g., postgres-primary, api-gateway">
+              </div>
+              <div class="form-group col-half">
+                <label for="ticketReporter">Reporter / Telemetry Source</label>
+                <input type="text" id="ticketReporter" class="form-control" placeholder="e.g., Datadog Alert, PagerDuty">
+              </div>
+            </div>
+
+            <div class="form-group">
+              <div class="label-with-action">
+                <label for="ticketDescription">Ticket Description & Diagnostic Signals</label>
+                <button type="button" class="btn-link" id="btnSimulateNoise">+ Insert Raw Stack Trace</button>
+              </div>
+              <textarea id="ticketDescription" class="form-control font-mono" rows="7" placeholder="Paste ticket description, error logs, user reports, or stack traces..." required></textarea>
+            </div>
+
+            <div class="form-actions">
+              <button type="button" class="btn btn-secondary" id="btnRandomize">🎲 Random Synthetic Ticket</button>
+              <button type="submit" class="btn btn-primary" id="btnSubmitTriage">
+                <span class="btn-spinner" id="triageSpinner" style="display:none;"></span>
+                <span>⚡ Run AI Incident Triage</span>
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <!-- Right: Triage Results -->
+        <div class="card result-card" id="triageResultContainer">
+          <div class="empty-state" id="emptyResult">
+            <div class="empty-icon">🔍</div>
+            <h3>Awaiting Incident Payload</h3>
+            <p>Select a preset scenario on the left or enter a custom ticket description, then run AI triage to classify severity, extract runbooks, and route to on-call teams.</p>
+          </div>
+
+          <div id="triageResult" style="display: none;">
+            <!-- Result Header -->
+            <div class="result-header">
+              <div class="severity-badge-large" id="resSeverity">P0</div>
+              <div class="result-title-meta">
+                <h3 id="resTitle">Incident Title</h3>
+                <div class="result-chips">
+                  <span class="chip chip-category" id="resCategory">Database</span>
+                  <span class="chip chip-time" id="resLatency">⚡ 1.2ms</span>
+                  <span class="chip chip-engine" id="resEngine">Local Semantic RAG</span>
+                  <span class="chip chip-confidence" id="resConfidence">95% Confidence</span>
+                  <span class="chip chip-tokens" id="resTokens">🪙 0 Tokens</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Blast Radius & Severity Reasoning -->
+            <div class="alert-box alert-severity" id="resSeverityBox">
+              <strong>Impact Assessment:</strong> <span id="resBlastRadius">Global outage</span>
+              <p id="resSeverityReasoning" class="text-muted text-sm mt-1"></p>
+            </div>
+
+            <!-- Routing & On-Call Section -->
+            <div class="routing-section">
+              <h4>👥 Assigned Escalation Team</h4>
+              <div class="team-card">
+                <div class="team-info">
+                  <div class="team-name" id="resTeamName">Data & Database Platform</div>
+                  <div class="team-meta">
+                    <span>👤 Lead On-Call: <strong id="resTeamLead">Sarah Jenkins</strong></span>
+                    <span>💬 Channel: <code id="resTeamSlack">#incident-db</code></span>
+                  </div>
+                  <p class="text-sm text-muted mt-1" id="resTeamPolicy"></p>
+                </div>
+                <div class="sla-box">
+                  <span class="sla-title">SLA TARGET</span>
+                  <span class="sla-time" id="resSlaTime">15m Response</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- RAG Retrieved Runbooks -->
+            <div class="rag-section">
+              <h4>📖 RAG Knowledge Base Citations (<span id="resRagCount">3</span> matched)</h4>
+              <div class="rag-cards" id="resRagCards">
+                <!-- Injected dynamically -->
+              </div>
+            </div>
+
+            <!-- Remediation Checklist & CLI Commands -->
+            <div class="remediation-section">
+              <h4>🛠️ Actionable Remediation Plan</h4>
+              <div class="remediation-summary" id="resRemediationSummary"></div>
+
+              <div class="checklist-wrap">
+                <h5>Immediate Mitigation Steps:</h5>
+                <ul class="remediation-list" id="resImmediateActions"></ul>
+              </div>
+
+              <div class="commands-wrap">
+                <div class="label-with-action">
+                  <h5>Diagnostic Commands to Execute:</h5>
+                  <button class="btn btn-xs btn-outline" id="btnCopyAllCommands">📋 Copy All</button>
+                </div>
+                <div class="command-snippets" id="resCommands"></div>
+              </div>
+
+              <div class="long-term-wrap">
+                <h5>Permanent Architectural Fix:</h5>
+                <p class="text-sm text-muted" id="resLongTermFix"></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: SYNTHETIC INCIDENTS FEED -->
+    <section id="tab-feed" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>📋 Synthetic Incident Ingestion Feed</h2>
+            <p class="subtitle">Curated dataset of simulated system failures with ground-truth evaluations</p>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-outline" id="btnSimulateStream">🌊 Stream Random Incident</button>
+            <button class="btn btn-primary" id="btnTriageAllFeed">⚡ Batch Triage All</button>
+          </div>
+        </div>
+
+        <div class="filter-bar">
+          <input type="text" id="feedSearch" class="form-control" placeholder="Search incidents by title, service, error...">
+          <select id="feedFilterSeverity" class="form-control">
+            <option value="">All Severities</option>
+            <option value="P0">P0 - Critical</option>
+            <option value="P1">P1 - High</option>
+            <option value="P2">P2 - Medium</option>
+            <option value="P3">P3 - Low</option>
+          </select>
+          <select id="feedFilterCategory" class="form-control">
+            <option value="">All Categories</option>
+            <option value="Database">Database</option>
+            <option value="Security & Auth">Security & Auth</option>
+            <option value="Infrastructure & Cloud">Infrastructure & Cloud</option>
+            <option value="API & Microservices">API & Microservices</option>
+            <option value="Billing & Payments">Billing & Payments</option>
+            <option value="Frontend & Client">Frontend & Client</option>
+            <option value="Network & CDN">Network & CDN</option>
+          </select>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table" id="feedTable">
+            <thead>
+              <tr>
+                <th>Ticket ID</th>
+                <th>Severity</th>
+                <th>Category</th>
+                <th>Service</th>
+                <th>Title</th>
+                <th>Target Team</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="feedTableBody">
+              <!-- Rendered via app.js -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: RAG KNOWLEDGE BASE -->
+    <section id="tab-kb" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>📚 SRE Runbook & Post-Mortem Knowledge Base</h2>
+            <p class="subtitle">Indexed vector documents used by the RAG retriever for root-cause synthesis</p>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-primary" id="btnAddRunbookModal">+ Add Custom Runbook</button>
+          </div>
+        </div>
+
+        <div class="filter-bar">
+          <input type="text" id="kbSearch" class="form-control" placeholder="Search knowledge base by keyword, symptom, command...">
+        </div>
+
+        <div class="runbook-grid" id="runbookGrid">
+          <!-- Rendered via app.js -->
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: BENCHMARK & EVALUATION -->
+    <section id="tab-benchmark" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>🔬 Model Performance & Evaluation Benchmark</h2>
+            <p class="subtitle">Quantitative metrics computed against synthetic ground-truth incident datasets</p>
+          </div>
+          <button class="btn btn-primary" id="btnRunLiveBenchmark">
+            <span class="btn-spinner" id="benchSpinner" style="display:none;"></span>
+            <span>▶️ Run Evaluation Benchmark</span>
+          </button>
+        </div>
+
+        <!-- Metric KPI Cards -->
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">Severity Accuracy</div>
+            <div class="kpi-value text-success" id="kpiSeverity">100%</div>
+            <div class="kpi-sub">Exact P0-P3 match</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Category Accuracy</div>
+            <div class="kpi-value text-success" id="kpiCategory">100%</div>
+            <div class="kpi-sub">Domain classification</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Team Routing Accuracy</div>
+            <div class="kpi-value text-success" id="kpiRouting">100%</div>
+            <div class="kpi-sub">SRE/SecOps/DB/Ops</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">RAG Top-1 Retrieval</div>
+            <div class="kpi-value text-info" id="kpiRagTop1">100%</div>
+            <div class="kpi-sub">Best matching runbook</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Avg Inference Latency</div>
+            <div class="kpi-value text-warning" id="kpiLatency">0.6 ms</div>
+            <div class="kpi-sub">Ultra low latency</div>
+          </div>
+        </div>
+
+        <!-- Detailed Benchmark Table -->
+        <div class="mt-4">
+          <h3>Detailed Evaluation Results</h3>
+          <div class="table-responsive">
+            <table class="data-table" id="benchmarkTable">
+              <thead>
+                <tr>
+                  <th>Ticket</th>
+                  <th>Ground Truth Sev</th>
+                  <th>Predicted Sev</th>
+                  <th>Ground Truth Cat</th>
+                  <th>Predicted Cat</th>
+                  <th>Routed Team</th>
+                  <th>RAG Hit</th>
+                  <th>Latency</th>
+                </tr>
+              </thead>
+              <tbody id="benchmarkTableBody">
+                <!-- Rendered dynamically -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay" id="settingsModal" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>⚙️ AI Engine Settings</h3>
+        <button class="btn-close" id="btnCloseSettings">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-sm text-muted mb-3">
+          Configure Google Gemini API key to enable multimodal LLM reasoning (Gemini 2.5 Flash), or keep blank to use the high-performance Local Deterministic RAG Engine.
+        </p>
+        <div class="form-group">
+          <label for="geminiApiKeyInput">Google Gemini API Key</label>
+          <input type="password" id="geminiApiKeyInput" class="form-control font-mono" placeholder="AIzaSy...">
+        </div>
+        <div class="form-group">
+          <label for="geminiModelSelect">Gemini Model</label>
+          <select id="geminiModelSelect" class="form-control">
+            <option value="gemini-3.8-flash" selected>gemini-3.8-flash (Recommended: Latest SRE Reasoning & High Speed)</option>
+            <option value="gemini-2.5-flash">gemini-2.5-flash (Legacy)</option>
+          </select>
+        </div>
+        <div class="engine-status-box" id="modalEngineStatus">
+          <span>Active Engine:</span> <strong id="modalActiveEngine">Local Deterministic RAG</strong>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" id="btnSaveOffline">Run Offline (No API Key)</button>
+        <button class="btn btn-primary" id="btnSaveSettings">Save Configuration</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Runbook Modal -->
+  <div class="modal-overlay" id="addRunbookModal" style="display:none;">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <h3>📖 Add New Knowledge Base Runbook</h3>
+        <button class="btn-close" id="btnCloseRunbookModal">&times;</button>
+      </div>
+      <form id="addRunbookForm">
+        <div class="modal-body">
+          <div class="form-row">
+            <div class="form-group col-half">
+              <label>Runbook ID</label>
+              <input type="text" id="rbId" class="form-control font-mono" placeholder="RB-CUSTOM-001" required>
+            </div>
+            <div class="form-group col-half">
+              <label>Category</label>
+              <select id="rbCategory" class="form-control" required>
+                <option value="Database">Database</option>
+                <option value="Security & Auth">Security & Auth</option>
+                <option value="Infrastructure & Cloud">Infrastructure & Cloud</option>
+                <option value="API & Microservices">API & Microservices</option>
+                <option value="Billing & Payments">Billing & Payments</option>
+                <option value="Frontend & Client">Frontend & Client</option>
+                <option value="Network & CDN">Network & CDN</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Runbook Title</label>
+            <input type="text" id="rbTitle" class="form-control" placeholder="e.g., MongoDB Connection Pool Saturation" required>
+          </div>
+
+          <div class="form-group">
+            <label>Symptoms (one per line)</label>
+            <textarea id="rbSymptoms" class="form-control" rows="3" placeholder="MongoTimeoutException: No replica set members found&#10;p99 latency spike to 4000ms" required></textarea>
+          </div>
+
+          <div class="form-group">
+            <label>Diagnostic Commands (one per line)</label>
+            <textarea id="rbCommands" class="form-control font-mono" rows="3" placeholder="mongosh --eval 'db.serverStatus().connections'&#10;kubectl logs -l app=catalog-service --tail=100"></textarea>
+          </div>
+
+          <div class="form-group">
+            <label>Mitigation Steps (one per line)</label>
+            <textarea id="rbMitigation" class="form-control" rows="3" placeholder="Scale up mongos query router replicas&#10;Kill long running aggregation queries"></textarea>
+          </div>
+
+          <div class="form-group">
+            <label>Long Term Fix</label>
+            <input type="text" id="rbLongTerm" class="form-control" placeholder="Implement client-side connection pooling limits">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline" id="btnCancelRunbook">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save & Index Runbook</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
+
